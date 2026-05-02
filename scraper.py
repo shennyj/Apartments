@@ -270,6 +270,95 @@ def scrape_apartments_com(min_price=None, max_price=None):
 
 
 # ---------------------------------------------------------------------------
+# Zillow
+# ---------------------------------------------------------------------------
+
+def scrape_zillow(min_price=None, max_price=None):
+    """
+    Zillow embeds listing data in a __NEXT_DATA__ JSON blob on their rental
+    search pages. We parse that directly — no browser needed.
+    """
+    url = "https://www.zillow.com/san-francisco-ca/rentals/3-_beds/3.0-_baths/"
+    params = {}
+    if min_price:
+        params["price_min"] = min_price
+    if max_price:
+        params["price_max"] = max_price
+
+    zillow_headers = {
+        **HEADERS,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.zillow.com/",
+    }
+
+    listings = []
+    try:
+        resp = requests.get(url, params=params, headers=zillow_headers, timeout=20)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        next_data_el = soup.select_one("script#__NEXT_DATA__")
+        if not next_data_el:
+            print("  [Zillow] no __NEXT_DATA__ found (may be blocked)")
+            return listings
+
+        payload = json.loads(next_data_el.string or "{}")
+
+        # Navigate to the listing results — path varies by page version
+        search_state = (
+            payload.get("props", {})
+            .get("pageProps", {})
+            .get("searchPageState", {})
+        )
+        list_results = (
+            search_state.get("cat1", {})
+            .get("searchResults", {})
+            .get("listResults", [])
+        )
+
+        for item in list_results:
+            try:
+                detail_url = item.get("detailUrl") or item.get("url") or ""
+                if detail_url and not detail_url.startswith("http"):
+                    detail_url = "https://www.zillow.com" + detail_url
+
+                price = item.get("price") or item.get("unformattedPrice") or ""
+                sqft = str(item.get("area") or item.get("sqft") or "")
+
+                home_info = item.get("hdpData", {}).get("homeInfo", {})
+                neighborhood = (
+                    home_info.get("neighborhood")
+                    or home_info.get("city")
+                    or item.get("address", "").split(",")[-1].strip()
+                    or "San Francisco"
+                )
+
+                listings.append({
+                    "source": "Zillow",
+                    "title": item.get("address") or item.get("streetAddress") or "",
+                    "price": str(price),
+                    "sqft": sqft,
+                    "neighborhood": neighborhood,
+                    "url": detail_url,
+                    "date_scraped": TODAY,
+                    "post_date": "",
+                })
+            except Exception:
+                continue
+
+        print(f"  [Zillow] {len(listings)} results")
+
+    except requests.HTTPError as e:
+        print(f"  [Zillow] blocked or error: {e}")
+    except Exception as e:
+        print(f"  [Zillow] error: {e}")
+
+    return listings
+
+
+# ---------------------------------------------------------------------------
 # Google Sheets
 # ---------------------------------------------------------------------------
 
@@ -376,6 +465,12 @@ def main():
     apts_listings = scrape_apartments_com(min_price=min_price, max_price=max_price)
     print(f"  {len(apts_listings)} listings found")
     all_listings.extend(apts_listings)
+
+    # --- Zillow ---
+    print("\nZillow:")
+    zl_listings = scrape_zillow(min_price=min_price, max_price=max_price)
+    print(f"  {len(zl_listings)} listings found")
+    all_listings.extend(zl_listings)
 
     print(f"\nTotal: {len(all_listings)} listings across all sources")
     print("Sending to Google Sheets...")
