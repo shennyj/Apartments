@@ -30,8 +30,11 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Install Playwright system dependencies
+        run: sudo apt-get install -y libasound2t64 libgstreamer-plugins-bad1.0-0 libgles2 libgudev-1.0-0
+
       - name: Install Playwright browsers
-        run: playwright install chromium --with-deps
+        run: playwright install chromium
 
       - name: Run scraper
         env:
