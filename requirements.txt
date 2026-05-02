@@ -4,3 +4,4 @@ gspread==6.1.2
 google-auth==2.29.0
 python-dotenv==1.0.1
 playwright==1.44.0
+playwright-stealth==1.0.6

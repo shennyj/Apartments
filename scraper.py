@@ -14,6 +14,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright
+from playwright_stealth import stealth_sync
 
 load_dotenv()
 
@@ -136,12 +137,13 @@ def enrich_craigslist(listing):
 def _get_next_data(page, url, label, wait_for=None):
     """Navigate to url, optionally wait for a selector, return parsed __NEXT_DATA__ or None."""
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        page.goto(url, wait_until="networkidle", timeout=45_000)
         if wait_for:
             try:
-                page.wait_for_selector(wait_for, timeout=8_000)
+                page.wait_for_selector(wait_for, timeout=10_000)
             except Exception:
                 pass
+        print(f"  [{label}] page title: {page.title()!r}")
         raw = page.evaluate(
             "() => { const e = document.getElementById('__NEXT_DATA__'); return e ? e.textContent : null; }"
         )
@@ -156,10 +158,10 @@ def _get_next_data(page, url, label, wait_for=None):
 def _page_html(page, url, label, wait_for=None):
     """Navigate and return BeautifulSoup of the fully rendered page."""
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        page.goto(url, wait_until="networkidle", timeout=45_000)
         if wait_for:
             try:
-                page.wait_for_selector(wait_for, timeout=8_000)
+                page.wait_for_selector(wait_for, timeout=10_000)
             except Exception:
                 pass
         return BeautifulSoup(page.content(), "html.parser")
@@ -355,8 +357,7 @@ def scrape_with_playwright(min_price=None, max_price=None):
             locale="en-US",
         )
         page = ctx.new_page()
-        # Block images/fonts to speed up page loads
-        page.route("**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf}", lambda r: r.abort())
+        stealth_sync(page)  # Patch headless browser detection signals
 
         print("\nZillow:")
         all_listings.extend(_scrape_zillow(page, min_price, max_price))
