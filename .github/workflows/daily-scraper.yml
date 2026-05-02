@@ -1,0 +1,39 @@
+name: Daily SF Apartment Scraper
+
+on:
+  schedule:
+    # 7 AM PST (UTC-8) = 15:00 UTC on weekdays
+    - cron: '0 15 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      min_price:
+        description: 'Min monthly rent (optional)'
+        required: false
+      max_price:
+        description: 'Max monthly rent (optional)'
+        required: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          MIN_PRICE: ${{ github.event.inputs.min_price || vars.MIN_PRICE }}
+          MAX_PRICE: ${{ github.event.inputs.max_price || vars.MAX_PRICE }}
+        run: python scraper.py
