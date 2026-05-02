@@ -14,7 +14,6 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright
-from playwright_stealth import stealth_sync
 
 load_dotenv()
 
@@ -357,7 +356,13 @@ def scrape_with_playwright(min_price=None, max_price=None):
             locale="en-US",
         )
         page = ctx.new_page()
-        stealth_sync(page)  # Patch headless browser detection signals
+        # Patch the most common headless-browser detection signals
+        page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            window.chrome = { runtime: {} };
+        """)
 
         print("\nZillow:")
         all_listings.extend(_scrape_zillow(page, min_price, max_price))
