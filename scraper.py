@@ -32,6 +32,7 @@ BROWSER_UA = (
 )
 SHEET_COLUMNS = ["Date Scraped", "Post Date", "Title", "Price", "Sqft", "Neighborhood", "Source", "URL"]
 TODAY = datetime.now().strftime("%Y-%m-%d")
+MAX_PER_SOURCE = 5
 
 
 # ---------------------------------------------------------------------------
@@ -43,7 +44,8 @@ def scrape_craigslist(min_price=None, max_price=None):
     params = {
         "bedrooms": 3,
         "bathrooms": 3,
-        "laundry": 1,   # w/d in unit only
+        "laundry": 1,    # w/d in unit only
+        "kitchen": 1,    # must have kitchen
     }
     if min_price:
         params["min_price"] = min_price
@@ -93,11 +95,11 @@ def scrape_craigslist(min_price=None, max_price=None):
                 continue
 
         print(f"  [Craigslist] offset {offset}: {new_on_page} new / {len(results)} total")
-        if new_on_page == 0:
+        if new_on_page == 0 or len(listings) >= MAX_PER_SOURCE:
             break
         time.sleep(2)
 
-    return listings
+    return listings[:MAX_PER_SOURCE]
 
 
 def enrich_craigslist(listing):
@@ -404,7 +406,7 @@ def _scrape_zumper(page, min_price=None, max_price=None):
 
 
 # ---------------------------------------------------------------------------
-# Playwright runner  (Zumper only — Zillow/Apartments.com block datacenter IPs)
+# Playwright runner
 # ---------------------------------------------------------------------------
 
 def scrape_with_playwright(min_price=None, max_price=None):
@@ -424,8 +426,20 @@ def scrape_with_playwright(min_price=None, max_price=None):
             window.chrome = { runtime: {} };
         """)
 
+        print("\nZillow:")
+        results = _scrape_zillow(page, min_price, max_price)[:MAX_PER_SOURCE]
+        print(f"  {len(results)} listings")
+        all_listings.extend(results)
+
+        print("\nApartments.com:")
+        results = _scrape_apartments_com(page, min_price, max_price)[:MAX_PER_SOURCE]
+        print(f"  {len(results)} listings")
+        all_listings.extend(results)
+
         print("\nZumper:")
-        all_listings.extend(_scrape_zumper(page, min_price, max_price))
+        results = _scrape_zumper(page, min_price, max_price)[:MAX_PER_SOURCE]
+        print(f"  {len(results)} listings")
+        all_listings.extend(results)
 
         browser.close()
     return all_listings
@@ -526,9 +540,7 @@ def main():
         time.sleep(1)
     all_listings.extend(cl_listings)
 
-    # --- Zumper (Playwright) ---
-    # Note: Zillow and Apartments.com block GitHub Actions IPs via Imperva/Cloudflare
-    print("\nZumper:")
+    # --- Zillow, Apartments.com, Zumper (Playwright) ---
     all_listings.extend(scrape_with_playwright(min_price=min_price, max_price=max_price))
 
     print(f"\nTotal: {len(all_listings)} listings across all sources")
