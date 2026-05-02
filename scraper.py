@@ -41,6 +41,8 @@ def scrape_craigslist(min_price=None, max_price=None):
         params["max_price"] = max_price
 
     listings = []
+    seen_urls = set()
+
     for offset in range(0, 481, 120):
         params["s"] = offset
         try:
@@ -55,6 +57,7 @@ def scrape_craigslist(min_price=None, max_price=None):
         if not results:
             break
 
+        new_on_page = 0
         for item in results:
             try:
                 title_el = item.select_one("div.title") or item.select_one("a.result-title")
@@ -65,6 +68,10 @@ def scrape_craigslist(min_price=None, max_price=None):
                 url = link_el.get("href", "")
                 if url and not url.startswith("http"):
                     url = "https://sfbay.craigslist.org" + url
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                new_on_page += 1
                 listings.append({
                     "source": "Craigslist",
                     "title": title_el.text.strip(),
@@ -75,7 +82,9 @@ def scrape_craigslist(min_price=None, max_price=None):
             except Exception:
                 continue
 
-        print(f"  [Craigslist] offset {offset}: {len(results)} results")
+        print(f"  [Craigslist] offset {offset}: {new_on_page} new / {len(results)} total")
+        if new_on_page == 0:
+            break  # CL is looping — no more unique results
         time.sleep(2)
 
     return listings
@@ -120,70 +129,68 @@ def enrich_craigslist(listing):
 
 def scrape_zumper(min_price=None, max_price=None):
     """
-    Zumper exposes a JSON API used by its own frontend. We query it directly.
+    Parse Zumper's search page __NEXT_DATA__ JSON blob for SF 3BR/3BA rentals.
     """
-    api_url = "https://www.zumper.com/api/t/1/listings"
-    params = {
-        "beds": "3",
-        "baths": "3",
-        "city_ids": "1738",   # San Francisco, CA
-        "order_by": "posted_time",
-        "page": 1,
-    }
+    url = "https://www.zumper.com/apartments-for-rent/san-francisco-ca"
+    params = {"beds": "3", "baths": "3"}
     if min_price:
         params["price_min"] = min_price
     if max_price:
         params["price_max"] = max_price
 
+    zumper_headers = {
+        **HEADERS,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": "https://www.zumper.com/",
+    }
+
     listings = []
-    headers = {**HEADERS, "Accept": "application/json", "Referer": "https://www.zumper.com/"}
+    try:
+        resp = requests.get(url, params=params, headers=zumper_headers, timeout=20)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-    for page in range(1, 6):
-        params["page"] = page
-        try:
-            resp = requests.get(api_url, params=params, headers=headers, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            print(f"  [Zumper] error on page {page}: {e}")
-            break
+        next_data_el = soup.select_one("script#__NEXT_DATA__")
+        if not next_data_el:
+            print("  [Zumper] no __NEXT_DATA__ found (may be blocked)")
+            return listings
 
-        results = data if isinstance(data, list) else data.get("listings", data.get("data", []))
-        if not results:
-            break
+        payload = json.loads(next_data_el.string or "{}")
+        props = payload.get("props", {}).get("pageProps", {})
 
-        for item in results:
+        # Try several known paths for the listing array
+        raw = (
+            props.get("listings")
+            or props.get("initialState", {}).get("listings", {}).get("listings", [])
+            or props.get("searchResults", [])
+        )
+
+        for item in (raw or []):
             try:
                 price = item.get("price") or item.get("price_max") or ""
                 price_str = f"${price:,}" if isinstance(price, (int, float)) and price else str(price)
-                url = item.get("url") or item.get("link") or ""
-                if url and not url.startswith("http"):
-                    url = "https://www.zumper.com" + url
-                sqft = str(item.get("sqft") or item.get("area") or "")
-                neighborhood = (
-                    item.get("neighborhood")
-                    or item.get("area")
-                    or item.get("city")
-                    or ""
-                )
-                title = item.get("title") or item.get("name") or item.get("address") or ""
+                detail_url = item.get("url") or item.get("link") or ""
+                if detail_url and not detail_url.startswith("http"):
+                    detail_url = "https://www.zumper.com" + detail_url
                 listings.append({
                     "source": "Zumper",
-                    "title": str(title).strip(),
+                    "title": str(item.get("address") or item.get("title") or item.get("name") or "").strip(),
                     "price": price_str,
-                    "sqft": sqft,
-                    "neighborhood": str(neighborhood).strip(),
-                    "url": url,
+                    "sqft": str(item.get("sqft") or item.get("area") or ""),
+                    "neighborhood": str(item.get("neighborhood") or item.get("city") or "San Francisco"),
+                    "url": detail_url,
                     "date_scraped": TODAY,
                     "post_date": "",
                 })
             except Exception:
                 continue
 
-        print(f"  [Zumper] page {page}: {len(results)} results")
-        if len(results) < 20:
-            break
-        time.sleep(1.5)
+        print(f"  [Zumper] {len(listings)} results")
+
+    except requests.HTTPError as e:
+        print(f"  [Zumper] blocked or error: {e}")
+    except Exception as e:
+        print(f"  [Zumper] error: {e}")
 
     return listings
 
