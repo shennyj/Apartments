@@ -1,5 +1,5 @@
 """
-SF 3BR/3BA apartment scraper — Craigslist, Zumper, Apartments.com
+SF 3BR/3BA apartment scraper — Craigslist (requests), Zumper/Apartments.com/Zillow (Playwright)
 Deduplicates by URL and appends new listings to a Google Sheet.
 """
 
@@ -13,10 +13,11 @@ import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
+from playwright.sync_api import sync_playwright
 
 load_dotenv()
 
-HEADERS = {
+REQUESTS_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -24,12 +25,17 @@ HEADERS = {
     ),
     "Accept-Language": "en-US,en;q=0.9",
 }
+BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 SHEET_COLUMNS = ["Date Scraped", "Post Date", "Title", "Price", "Sqft", "Neighborhood", "Source", "URL"]
 TODAY = datetime.now().strftime("%Y-%m-%d")
 
 
 # ---------------------------------------------------------------------------
-# Craigslist
+# Craigslist  (plain HTTP — works without a browser)
 # ---------------------------------------------------------------------------
 
 def scrape_craigslist(min_price=None, max_price=None):
@@ -46,7 +52,7 @@ def scrape_craigslist(min_price=None, max_price=None):
     for offset in range(0, 481, 120):
         params["s"] = offset
         try:
-            resp = requests.get(base_url, params=params, headers=HEADERS, timeout=15)
+            resp = requests.get(base_url, params=params, headers=REQUESTS_HEADERS, timeout=15)
             resp.raise_for_status()
         except requests.RequestException as e:
             print(f"  [Craigslist] fetch error at offset {offset}: {e}")
@@ -84,7 +90,7 @@ def scrape_craigslist(min_price=None, max_price=None):
 
         print(f"  [Craigslist] offset {offset}: {new_on_page} new / {len(results)} total")
         if new_on_page == 0:
-            break  # CL is looping — no more unique results
+            break
         time.sleep(2)
 
     return listings
@@ -93,7 +99,7 @@ def scrape_craigslist(min_price=None, max_price=None):
 def enrich_craigslist(listing):
     """Fetch individual Craigslist page for post_date, neighborhood, sqft."""
     try:
-        resp = requests.get(listing["url"], headers=HEADERS, timeout=15)
+        resp = requests.get(listing["url"], headers=REQUESTS_HEADERS, timeout=15)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -124,47 +130,193 @@ def enrich_craigslist(listing):
 
 
 # ---------------------------------------------------------------------------
-# Zumper
+# Playwright helpers
 # ---------------------------------------------------------------------------
 
-def scrape_zumper(min_price=None, max_price=None):
-    """
-    Parse Zumper's search page __NEXT_DATA__ JSON blob for SF 3BR/3BA rentals.
-    """
-    url = "https://www.zumper.com/apartments-for-rent/san-francisco-ca"
-    params = {"beds": "3", "baths": "3"}
-    if min_price:
-        params["price_min"] = min_price
-    if max_price:
-        params["price_max"] = max_price
-
-    zumper_headers = {
-        **HEADERS,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": "https://www.zumper.com/",
-    }
-
-    listings = []
+def _get_next_data(page, url, label, wait_for=None):
+    """Navigate to url, optionally wait for a selector, return parsed __NEXT_DATA__ or None."""
     try:
-        resp = requests.get(url, params=params, headers=zumper_headers, timeout=20)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
+        page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        if wait_for:
+            try:
+                page.wait_for_selector(wait_for, timeout=8_000)
+            except Exception:
+                pass
+        raw = page.evaluate(
+            "() => { const e = document.getElementById('__NEXT_DATA__'); return e ? e.textContent : null; }"
+        )
+        if raw:
+            return json.loads(raw)
+        print(f"  [{label}] no __NEXT_DATA__ found")
+    except Exception as e:
+        print(f"  [{label}] Playwright error: {e}")
+    return None
 
-        next_data_el = soup.select_one("script#__NEXT_DATA__")
-        if not next_data_el:
-            print("  [Zumper] no __NEXT_DATA__ found (may be blocked)")
+
+def _page_html(page, url, label, wait_for=None):
+    """Navigate and return BeautifulSoup of the fully rendered page."""
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        if wait_for:
+            try:
+                page.wait_for_selector(wait_for, timeout=8_000)
+            except Exception:
+                pass
+        return BeautifulSoup(page.content(), "html.parser")
+    except Exception as e:
+        print(f"  [{label}] Playwright error: {e}")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Zillow  (Playwright)
+# ---------------------------------------------------------------------------
+
+def _scrape_zillow(page, min_price=None, max_price=None):
+    url = "https://www.zillow.com/san-francisco-ca/rentals/3-_beds/3.0-_baths/"
+    if min_price or max_price:
+        parts = []
+        if min_price:
+            parts.append(f"price_min={min_price}")
+        if max_price:
+            parts.append(f"price_max={max_price}")
+        url += "?" + "&".join(parts)
+
+    data = _get_next_data(page, url, "Zillow")
+    listings = []
+    if not data:
+        return listings
+
+    list_results = (
+        data.get("props", {})
+        .get("pageProps", {})
+        .get("searchPageState", {})
+        .get("cat1", {})
+        .get("searchResults", {})
+        .get("listResults", [])
+    )
+
+    for item in list_results:
+        try:
+            detail_url = item.get("detailUrl") or item.get("url") or ""
+            if detail_url and not detail_url.startswith("http"):
+                detail_url = "https://www.zillow.com" + detail_url
+            home_info = item.get("hdpData", {}).get("homeInfo", {})
+            neighborhood = (
+                home_info.get("neighborhood")
+                or home_info.get("city")
+                or "San Francisco"
+            )
+            listings.append({
+                "source": "Zillow",
+                "title": item.get("address") or item.get("streetAddress") or "",
+                "price": str(item.get("price") or item.get("unformattedPrice") or ""),
+                "sqft": str(item.get("area") or item.get("sqft") or ""),
+                "neighborhood": neighborhood,
+                "url": detail_url,
+                "date_scraped": TODAY,
+                "post_date": "",
+            })
+        except Exception:
+            continue
+
+    print(f"  [Zillow] {len(listings)} results")
+    return listings
+
+
+# ---------------------------------------------------------------------------
+# Apartments.com  (Playwright)
+# ---------------------------------------------------------------------------
+
+def _scrape_apartments_com(page, min_price=None, max_price=None):
+    price_slug = ""
+    if min_price and max_price:
+        price_slug = f"{min_price}-to-{max_price}/"
+    elif max_price:
+        price_slug = f"under-{max_price}/"
+
+    url = f"https://www.apartments.com/san-francisco-ca/3-bedrooms/{price_slug}"
+    listings = []
+
+    # Try __NEXT_DATA__ first
+    data = _get_next_data(page, url, "Apartments.com", wait_for="article.placard")
+    if data:
+        props = data.get("props", {}).get("pageProps", {})
+        raw = props.get("listings") or props.get("searchResults", {}).get("listings", [])
+        for item in (raw or []):
+            try:
+                price = item.get("rentRange") or item.get("price") or ""
+                item_url = item.get("url") or item.get("listingUrl") or ""
+                if item_url:
+                    listings.append({
+                        "source": "Apartments.com",
+                        "title": item.get("name") or item.get("title") or "",
+                        "price": str(price),
+                        "sqft": str(item.get("sqft") or ""),
+                        "neighborhood": item.get("neighborhood") or "San Francisco",
+                        "url": item_url,
+                        "date_scraped": TODAY,
+                        "post_date": "",
+                    })
+            except Exception:
+                continue
+        if listings:
+            print(f"  [Apartments.com] {len(listings)} results (JSON)")
             return listings
 
-        payload = json.loads(next_data_el.string or "{}")
-        props = payload.get("props", {}).get("pageProps", {})
+    # Fall back to DOM
+    soup = _page_html(page, url, "Apartments.com", wait_for="article.placard")
+    if not soup:
+        return listings
 
-        # Try several known paths for the listing array
+    for card in soup.select("article.placard, li.mortar-wrapper"):
+        try:
+            title_el = card.select_one("span.js-placardTitle, .property-title, .js-propertyName")
+            price_el = card.select_one(".price-range, .js-priceSuffix, span.altRentDisplay")
+            link_el = card.select_one("a[href]")
+            if not title_el or not link_el:
+                continue
+            href = link_el.get("href", "")
+            if href and not href.startswith("http"):
+                href = "https://www.apartments.com" + href
+            listings.append({
+                "source": "Apartments.com",
+                "title": title_el.text.strip(),
+                "price": price_el.text.strip() if price_el else "",
+                "sqft": "",
+                "neighborhood": "San Francisco",
+                "url": href,
+                "date_scraped": TODAY,
+                "post_date": "",
+            })
+        except Exception:
+            continue
+
+    print(f"  [Apartments.com] {len(listings)} results (DOM)")
+    return listings
+
+
+# ---------------------------------------------------------------------------
+# Zumper  (Playwright)
+# ---------------------------------------------------------------------------
+
+def _scrape_zumper(page, min_price=None, max_price=None):
+    params = "?beds=3&baths=3"
+    if min_price:
+        params += f"&price_min={min_price}"
+    if max_price:
+        params += f"&price_max={max_price}"
+    url = f"https://www.zumper.com/apartments-for-rent/san-francisco-ca{params}"
+
+    listings = []
+    data = _get_next_data(page, url, "Zumper", wait_for="[data-tid='listing-card']")
+    if data:
+        props = data.get("props", {}).get("pageProps", {})
         raw = (
             props.get("listings")
             or props.get("initialState", {}).get("listings", {}).get("listings", [])
             or props.get("searchResults", [])
         )
-
         for item in (raw or []):
             try:
                 price = item.get("price") or item.get("price_max") or ""
@@ -174,7 +326,7 @@ def scrape_zumper(min_price=None, max_price=None):
                     detail_url = "https://www.zumper.com" + detail_url
                 listings.append({
                     "source": "Zumper",
-                    "title": str(item.get("address") or item.get("title") or item.get("name") or "").strip(),
+                    "title": str(item.get("address") or item.get("title") or "").strip(),
                     "price": price_str,
                     "sqft": str(item.get("sqft") or item.get("area") or ""),
                     "neighborhood": str(item.get("neighborhood") or item.get("city") or "San Francisco"),
@@ -185,184 +337,38 @@ def scrape_zumper(min_price=None, max_price=None):
             except Exception:
                 continue
 
-        print(f"  [Zumper] {len(listings)} results")
-
-    except requests.HTTPError as e:
-        print(f"  [Zumper] blocked or error: {e}")
-    except Exception as e:
-        print(f"  [Zumper] error: {e}")
-
+    print(f"  [Zumper] {len(listings)} results")
     return listings
 
 
 # ---------------------------------------------------------------------------
-# Apartments.com
+# Playwright runner  (single browser for all three sites)
 # ---------------------------------------------------------------------------
 
-def scrape_apartments_com(min_price=None, max_price=None):
-    """
-    Apartments.com embeds listing JSON inside a <script> tag (application/ld+json
-    or a __NEXT_DATA__ blob). We try to parse whichever is present.
-    """
-    price_slug = ""
-    if min_price and max_price:
-        price_slug = f"{min_price}-to-{max_price}/"
-    elif max_price:
-        price_slug = f"under-{max_price}/"
-
-    url = f"https://www.apartments.com/san-francisco-ca/3-bedrooms/{price_slug}"
-    listings = []
-
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        # Try __NEXT_DATA__ JSON blob first
-        next_data_el = soup.select_one("script#__NEXT_DATA__")
-        if next_data_el:
-            payload = json.loads(next_data_el.string or "{}")
-            props = payload.get("props", {}).get("pageProps", {})
-            raw_listings = (
-                props.get("listings")
-                or props.get("searchResults", {}).get("listings", [])
-            )
-            for item in (raw_listings or []):
-                try:
-                    price = item.get("rentRange") or item.get("price") or ""
-                    listings.append({
-                        "source": "Apartments.com",
-                        "title": item.get("name") or item.get("title") or "",
-                        "price": str(price),
-                        "sqft": str(item.get("sqft") or ""),
-                        "neighborhood": item.get("neighborhood") or item.get("city") or "San Francisco",
-                        "url": item.get("url") or item.get("listingUrl") or "",
-                        "date_scraped": TODAY,
-                        "post_date": "",
-                    })
-                except Exception:
-                    continue
-            print(f"  [Apartments.com] __NEXT_DATA__: {len(listings)} results")
-            return listings
-
-        # Fall back to HTML scraping
-        for card in soup.select("article.placard, li.mortar-wrapper, div[data-listingid]"):
-            try:
-                title_el = card.select_one("span.js-placardTitle, .property-title, .js-propertyName")
-                price_el = card.select_one(".price-range, .js-priceSuffix, span.altRentDisplay")
-                link_el = card.select_one("a[href]")
-                if not title_el or not link_el:
-                    continue
-                href = link_el.get("href", "")
-                if href and not href.startswith("http"):
-                    href = "https://www.apartments.com" + href
-                listings.append({
-                    "source": "Apartments.com",
-                    "title": title_el.text.strip(),
-                    "price": price_el.text.strip() if price_el else "",
-                    "sqft": "",
-                    "neighborhood": "San Francisco",
-                    "url": href,
-                    "date_scraped": TODAY,
-                    "post_date": "",
-                })
-            except Exception:
-                continue
-        print(f"  [Apartments.com] HTML: {len(listings)} results")
-
-    except Exception as e:
-        print(f"  [Apartments.com] error: {e}")
-
-    return listings
-
-
-# ---------------------------------------------------------------------------
-# Zillow
-# ---------------------------------------------------------------------------
-
-def scrape_zillow(min_price=None, max_price=None):
-    """
-    Zillow embeds listing data in a __NEXT_DATA__ JSON blob on their rental
-    search pages. We parse that directly — no browser needed.
-    """
-    url = "https://www.zillow.com/san-francisco-ca/rentals/3-_beds/3.0-_baths/"
-    params = {}
-    if min_price:
-        params["price_min"] = min_price
-    if max_price:
-        params["price_max"] = max_price
-
-    zillow_headers = {
-        **HEADERS,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.zillow.com/",
-    }
-
-    listings = []
-    try:
-        resp = requests.get(url, params=params, headers=zillow_headers, timeout=20)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        next_data_el = soup.select_one("script#__NEXT_DATA__")
-        if not next_data_el:
-            print("  [Zillow] no __NEXT_DATA__ found (may be blocked)")
-            return listings
-
-        payload = json.loads(next_data_el.string or "{}")
-
-        # Navigate to the listing results — path varies by page version
-        search_state = (
-            payload.get("props", {})
-            .get("pageProps", {})
-            .get("searchPageState", {})
+def scrape_with_playwright(min_price=None, max_price=None):
+    all_listings = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        ctx = browser.new_context(
+            user_agent=BROWSER_UA,
+            viewport={"width": 1280, "height": 800},
+            locale="en-US",
         )
-        list_results = (
-            search_state.get("cat1", {})
-            .get("searchResults", {})
-            .get("listResults", [])
-        )
+        page = ctx.new_page()
+        # Block images/fonts to speed up page loads
+        page.route("**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf}", lambda r: r.abort())
 
-        for item in list_results:
-            try:
-                detail_url = item.get("detailUrl") or item.get("url") or ""
-                if detail_url and not detail_url.startswith("http"):
-                    detail_url = "https://www.zillow.com" + detail_url
+        print("\nZillow:")
+        all_listings.extend(_scrape_zillow(page, min_price, max_price))
 
-                price = item.get("price") or item.get("unformattedPrice") or ""
-                sqft = str(item.get("area") or item.get("sqft") or "")
+        print("\nApartments.com:")
+        all_listings.extend(_scrape_apartments_com(page, min_price, max_price))
 
-                home_info = item.get("hdpData", {}).get("homeInfo", {})
-                neighborhood = (
-                    home_info.get("neighborhood")
-                    or home_info.get("city")
-                    or item.get("address", "").split(",")[-1].strip()
-                    or "San Francisco"
-                )
+        print("\nZumper:")
+        all_listings.extend(_scrape_zumper(page, min_price, max_price))
 
-                listings.append({
-                    "source": "Zillow",
-                    "title": item.get("address") or item.get("streetAddress") or "",
-                    "price": str(price),
-                    "sqft": sqft,
-                    "neighborhood": neighborhood,
-                    "url": detail_url,
-                    "date_scraped": TODAY,
-                    "post_date": "",
-                })
-            except Exception:
-                continue
-
-        print(f"  [Zillow] {len(listings)} results")
-
-    except requests.HTTPError as e:
-        print(f"  [Zillow] blocked or error: {e}")
-    except Exception as e:
-        print(f"  [Zillow] error: {e}")
-
-    return listings
+        browser.close()
+    return all_listings
 
 
 # ---------------------------------------------------------------------------
@@ -411,7 +417,6 @@ def send_to_sheets(listings):
 
     try:
         all_values = ws.get_all_values()
-        # URL is the last column (index 7)
         existing_urls = {row[7] for row in all_values[1:] if len(row) > 7 and row[7]}
     except Exception:
         existing_urls = set()
@@ -451,7 +456,7 @@ def main():
 
     all_listings = []
 
-    # --- Craigslist ---
+    # --- Craigslist (plain HTTP) ---
     print("\nCraigslist:")
     cl_listings = scrape_craigslist(min_price=min_price, max_price=max_price)
     print(f"  Fetching details for {len(cl_listings)} listings...")
@@ -461,23 +466,8 @@ def main():
         time.sleep(1)
     all_listings.extend(cl_listings)
 
-    # --- Zumper ---
-    print("\nZumper:")
-    zp_listings = scrape_zumper(min_price=min_price, max_price=max_price)
-    print(f"  {len(zp_listings)} listings found")
-    all_listings.extend(zp_listings)
-
-    # --- Apartments.com ---
-    print("\nApartments.com:")
-    apts_listings = scrape_apartments_com(min_price=min_price, max_price=max_price)
-    print(f"  {len(apts_listings)} listings found")
-    all_listings.extend(apts_listings)
-
-    # --- Zillow ---
-    print("\nZillow:")
-    zl_listings = scrape_zillow(min_price=min_price, max_price=max_price)
-    print(f"  {len(zl_listings)} listings found")
-    all_listings.extend(zl_listings)
+    # --- Zillow, Apartments.com, Zumper (Playwright) ---
+    all_listings.extend(scrape_with_playwright(min_price=min_price, max_price=max_price))
 
     print(f"\nTotal: {len(all_listings)} listings across all sources")
     print("Sending to Google Sheets...")
