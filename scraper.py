@@ -40,7 +40,11 @@ TODAY = datetime.now().strftime("%Y-%m-%d")
 
 def scrape_craigslist(min_price=None, max_price=None):
     base_url = "https://sfbay.craigslist.org/search/sfc/apa"
-    params = {"bedrooms": 3, "bathrooms": 3}
+    params = {
+        "bedrooms": 3,
+        "bathrooms": 3,
+        "laundry": 1,   # w/d in unit only
+    }
     if min_price:
         params["min_price"] = min_price
     if max_price:
@@ -298,7 +302,7 @@ def _scrape_apartments_com(page, min_price=None, max_price=None):
 
 
 # ---------------------------------------------------------------------------
-# Zumper  (Playwright)
+# Zumper  (Playwright — intercept API responses + DOM fallback)
 # ---------------------------------------------------------------------------
 
 def _scrape_zumper(page, min_price=None, max_price=None):
@@ -310,40 +314,97 @@ def _scrape_zumper(page, min_price=None, max_price=None):
     url = f"https://www.zumper.com/apartments-for-rent/san-francisco-ca{params}"
 
     listings = []
-    data = _get_next_data(page, url, "Zumper", wait_for="[data-tid='listing-card']")
-    if data:
-        props = data.get("props", {}).get("pageProps", {})
-        raw = (
-            props.get("listings")
-            or props.get("initialState", {}).get("listings", {}).get("listings", [])
-            or props.get("searchResults", [])
-        )
-        for item in (raw or []):
-            try:
-                price = item.get("price") or item.get("price_max") or ""
-                price_str = f"${price:,}" if isinstance(price, (int, float)) and price else str(price)
-                detail_url = item.get("url") or item.get("link") or ""
-                if detail_url and not detail_url.startswith("http"):
-                    detail_url = "https://www.zumper.com" + detail_url
-                listings.append({
-                    "source": "Zumper",
-                    "title": str(item.get("address") or item.get("title") or "").strip(),
-                    "price": price_str,
-                    "sqft": str(item.get("sqft") or item.get("area") or ""),
-                    "neighborhood": str(item.get("neighborhood") or item.get("city") or "San Francisco"),
-                    "url": detail_url,
-                    "date_scraped": TODAY,
-                    "post_date": "",
-                })
-            except Exception:
-                continue
+    captured_json = []
 
+    def handle_response(response):
+        """Capture any JSON response that looks like a listings payload."""
+        try:
+            if response.status == 200 and "json" in response.headers.get("content-type", ""):
+                data = response.json()
+                # Accept arrays or objects that contain a list we can iterate
+                if isinstance(data, list) and data:
+                    captured_json.append(data)
+                elif isinstance(data, dict):
+                    for v in data.values():
+                        if isinstance(v, list) and len(v) > 2:
+                            captured_json.append(v)
+                            break
+        except Exception:
+            pass
+
+    page.on("response", handle_response)
+
+    try:
+        page.goto(url, wait_until="networkidle", timeout=45_000)
+        print(f"  [Zumper] page title: {page.title()!r}")
+
+        # Give extra time for any lazy-loaded API calls
+        page.wait_for_timeout(3_000)
+
+        # --- Try intercepted API payloads first ---
+        for payload in captured_json:
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    price = item.get("price") or item.get("price_max") or ""
+                    price_str = f"${price:,}" if isinstance(price, (int, float)) and price else str(price)
+                    detail_url = item.get("url") or item.get("link") or item.get("listingUrl") or ""
+                    if detail_url and not detail_url.startswith("http"):
+                        detail_url = "https://www.zumper.com" + detail_url
+                    if not detail_url:
+                        continue
+                    listings.append({
+                        "source": "Zumper",
+                        "title": str(item.get("address") or item.get("title") or item.get("name") or "").strip(),
+                        "price": price_str,
+                        "sqft": str(item.get("sqft") or item.get("area") or ""),
+                        "neighborhood": str(item.get("neighborhood") or item.get("city") or "San Francisco"),
+                        "url": detail_url,
+                        "date_scraped": TODAY,
+                        "post_date": "",
+                    })
+                except Exception:
+                    continue
+            if listings:
+                break
+
+        # --- DOM fallback ---
+        if not listings:
+            soup = BeautifulSoup(page.content(), "html.parser")
+            for card in soup.select("[data-tid='listing-card'], article.listing-card, div.listing-card"):
+                try:
+                    link_el = card.select_one("a[href]")
+                    price_el = card.select_one("[class*='price'], [class*='Price']")
+                    title_el = card.select_one("[class*='address'], [class*='Address'], h2, h3")
+                    if not link_el:
+                        continue
+                    href = link_el.get("href", "")
+                    if href and not href.startswith("http"):
+                        href = "https://www.zumper.com" + href
+                    listings.append({
+                        "source": "Zumper",
+                        "title": title_el.text.strip() if title_el else "",
+                        "price": price_el.text.strip() if price_el else "",
+                        "sqft": "",
+                        "neighborhood": "San Francisco",
+                        "url": href,
+                        "date_scraped": TODAY,
+                        "post_date": "",
+                    })
+                except Exception:
+                    continue
+
+    except Exception as e:
+        print(f"  [Zumper] error: {e}")
+
+    page.remove_listener("response", handle_response)
     print(f"  [Zumper] {len(listings)} results")
     return listings
 
 
 # ---------------------------------------------------------------------------
-# Playwright runner  (single browser for all three sites)
+# Playwright runner  (Zumper only — Zillow/Apartments.com block datacenter IPs)
 # ---------------------------------------------------------------------------
 
 def scrape_with_playwright(min_price=None, max_price=None):
@@ -356,19 +417,12 @@ def scrape_with_playwright(min_price=None, max_price=None):
             locale="en-US",
         )
         page = ctx.new_page()
-        # Patch the most common headless-browser detection signals
         page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
             Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
             window.chrome = { runtime: {} };
         """)
-
-        print("\nZillow:")
-        all_listings.extend(_scrape_zillow(page, min_price, max_price))
-
-        print("\nApartments.com:")
-        all_listings.extend(_scrape_apartments_com(page, min_price, max_price))
 
         print("\nZumper:")
         all_listings.extend(_scrape_zumper(page, min_price, max_price))
@@ -472,7 +526,9 @@ def main():
         time.sleep(1)
     all_listings.extend(cl_listings)
 
-    # --- Zillow, Apartments.com, Zumper (Playwright) ---
+    # --- Zumper (Playwright) ---
+    # Note: Zillow and Apartments.com block GitHub Actions IPs via Imperva/Cloudflare
+    print("\nZumper:")
     all_listings.extend(scrape_with_playwright(min_price=min_price, max_price=max_price))
 
     print(f"\nTotal: {len(all_listings)} listings across all sources")
